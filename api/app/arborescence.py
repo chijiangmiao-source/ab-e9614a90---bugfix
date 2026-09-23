@@ -7,15 +7,21 @@
 
 除规范树外，本模块还产出可复算的有向环收缩 / 展开记录：
   * 每一层为每个非根点选出的最小入边；
-  * 每次有向环收缩（环节点、环边、超点编号、入边代价修正、被丢弃的环内边）；
+  * 每次有向环收缩（环节点、环边、超点、入边代价 w − w*(v) 修正、
+    丢弃的环内非环边）；
   * 每次展开替换（进入通道、进入点、被替换的环边、保留的环边）。
 
-规范树的求得分两步：
-  1. 用 Edmonds 求出最小总代价 C*；
-  2. 按通道标识升序逐个尝试"强制入选"：若强制后仍存在代价为 C* 的
-     汇流树，则强制之。可证明最终强制集本身就是字典序最小的最优树。
-最后用 (代价, 是否规范边, 标识) 作为字典序边键再跑一次 Edmonds，
-保证产出的收缩记录恰好对应规范树。
+求解流程：
+  1. 每个非根点选键 (代价, 规范惩罚, 标识) 最小的入边；
+  2. 若选中边含有向环，则把环收缩为超点：环外→环内的入边代价修正为
+     w(e) − w*(enters)，环内边全部丢弃，递归求解收缩图；
+  3. 递归返回后展开：以进入超点的通道落回环内对应节点，删去该节点的
+     原环边、保留其余环边——代价变化与收缩时的修正严格抵消。嵌套环
+     由递归自然处理，最深层先展开；
+  4. 规范解：先用朴素键求最优代价 C*，再按通道标识升序逐条试探
+     "强制入选"（把强制边收缩为链块后递归求解），仅当最优代价仍为 C*
+     时接受；最后以 (代价, 是否规范边, 标识) 为键重跑 Edmonds，使产出
+     的收缩 / 展开记录恰好对应规范树。
 """
 
 from __future__ import annotations
@@ -47,8 +53,12 @@ class _Edge:
     orig: Channel
     u: str  # 当前层级的尾点（可能是超点）
     v: str  # 当前层级的头点（可能是超点）
-    key: tuple  # 字典序键 (代价, 惩罚, 标识)
-    enters: str  # 在当前层级上本边进入的节点（== v，展开时用来定位环边）
+    # 字典序键 (代价分量, 规范惩罚分量, 标识次序)；收缩时整组减去
+    # e.v 当前入口的键（分量分别相减）。字典序整数向量本身构成全序
+    # 阿贝尔群，Edmonds 的代价修正对它逐分量成立，嵌套任意层均不失真，
+    # 也不受用户代价数值范围影响。
+    key: tuple[int, int, int]
+    enters: str  # 本边最终落回的环内原始节点（展开时定位被替换环边）
     lower: "_Edge | None"  # 收缩前一层对应的边；原始层为 None
 
 
@@ -120,13 +130,13 @@ def validate_problem(
 # ---------------------------------------------------------------------------
 
 
-def _fresh_supernode(idx: int, used: set[str]) -> str:
-    name = f"S{idx}"
-    n = idx
-    while name in used:
-        n += 1
-        name = f"S{n}"
-    return name
+def _fresh_supernode(counter: list[int], nodes: set[str]) -> str:
+    """取一个不与本层任何节点（含用户点与既有超点）冲突的超点名。"""
+    while True:
+        name = f"S{counter[0]}"
+        counter[0] += 1
+        if name not in nodes:
+            return name
 
 
 def _find_cycle(nodes: list[str], root: str, in_edge: dict[str, _Edge]) -> list[str] | None:
@@ -170,31 +180,144 @@ def _solve_level(
     expansions: list[dict],
     sup_counter: list[int],
 ) -> list[_Edge] | None:
-    """在当前层级上求解；返回以本层 _Edge 表示的入选边，无解返回 None。
+    """单层 Chu–Liu/Edmonds：选最小入边 → 遇环收缩并递归 → 展开。
 
-    levels / expansions 收集可复算记录。
+    返回以**本层** _Edge 表示的入选边（恰好覆盖每个非根本层节点一条
+    入边），本层无可行树形图时返回 None。levels / expansions 收集记录。
     """
-    reached = {root}
-    picked: list[_Edge] = []
-    while len(reached) < len(nodes):
-        frontier = [e for e in edges if e.u in reached and e.v not in reached]
-        if not frontier:
-            return None
-        best = min(frontier, key=lambda e: e.key)
-        picked.append(best)
-        reached.add(best.v)
+    node_set = set(nodes)
+    # 进入根的边永远不可能属于以根为源的树形图，直接排除。
+    edges = [e for e in edges if e.v != root]
 
-    by_node = {e.v: e for e in picked}
+    # 1) 每个非根点选键最小的入边（键末位为唯一标识次序，结果与提交顺序无关）。
+    in_edges: dict[str, list[_Edge]] = {}
+    for e in edges:
+        in_edges.setdefault(e.v, []).append(e)
+
+    in_edge: dict[str, _Edge] = {}
+    chosen_detail: list[dict] = []
+    for n in sorted(nodes):
+        if n == root:
+            continue
+        cand = in_edges.get(n)
+        if not cand:
+            return None  # 本层存在无入边的非根节点 → 收缩图无解
+        best = min(cand, key=lambda e: e.key)
+        in_edge[n] = best
+        chosen_detail.append(
+            {"node": n, "channel": best.orig.id, "cost": best.key[0]}
+        )
+
+    # 2) 选中边中是否含有向环。
+    cycle = _find_cycle(sorted(nodes), root, in_edge)
+    if cycle is None:
+        levels.append(
+            {
+                "depth": depth,
+                "nodes": sorted(nodes),
+                "chosen": chosen_detail,
+                "cycle": None,
+            }
+        )
+        return [in_edge[n] for n in sorted(nodes) if n != root]
+
+    cycle_set = set(cycle)
+    nodes_fwd, channels_fwd = _cycle_forward(cycle, in_edge)
+    cycle_edge_ids = {in_edge[n].orig.id for n in cycle}
+
+    # 3) 收缩为超点，构造下一层边；同时整理代价修正 / 丢弃记录。
+    sup = _fresh_supernode(sup_counter, node_set)
+    contracted = [n for n in sorted(nodes) if n not in cycle_set] + [sup]
+
+    rewired_in: list[dict] = []
+    dropped_internal: list[str] = []
+    next_edges: list[_Edge] = []
+    for e in edges:
+        u_in = e.u in cycle_set
+        v_in = e.v in cycle_set
+        if u_in and v_in:
+            # 环内边：环边随环保留，其余环内边在收缩图中无意义，丢弃。
+            if e.orig.id not in cycle_edge_ids:
+                dropped_internal.append(e.orig.id)
+            continue
+        if not u_in and not v_in:
+            next_edges.append(
+                _Edge(e.orig, e.u, e.v, e.key, enters=e.enters, lower=e)
+            )
+        elif v_in and not u_in:
+            # 环外 → 环内：键的每个分量分别减去 e.v 当前入口的对应分量，
+            # 即代价修正 w(e) − w*(enters)，惩罚与标识次序一并平移。
+            star = in_edge[e.v]
+            nkey = (e.key[0] - star.key[0], e.key[1] - star.key[1], e.key[2])
+            rewired_in.append(
+                {
+                    "channel": e.orig.id,
+                    "from": e.orig.u,
+                    "to": e.orig.v,
+                    "original_cost": e.key[0],
+                    "adjusted_cost": nkey[0],
+                    "enters": e.v,
+                }
+            )
+            next_edges.append(
+                _Edge(e.orig, e.u, sup, nkey, enters=e.v, lower=e)
+            )
+        else:  # u_in and not v_in：环内 → 环外，尾点改挂超点。
+            next_edges.append(
+                _Edge(e.orig, sup, e.v, e.key, enters=e.enters, lower=e)
+            )
+
     levels.append(
         {
             "depth": depth,
             "nodes": sorted(nodes),
-            "chosen": [
-                {"node": n, "channel": by_node[n].orig.id, "cost": by_node[n].key[0]}
-                for n in sorted(nodes)
-                if n != root
-            ],
-            "cycle": None,
+            "chosen": chosen_detail,
+            "cycle": {
+                "supernode": sup,
+                "nodes": nodes_fwd,
+                "channels": channels_fwd,
+                "rewired_in": sorted(rewired_in, key=lambda r: r["channel"]),
+                "dropped_internal": sorted(dropped_internal),
+            },
+        }
+    )
+
+    # 4) 递归求解收缩图。
+    sub_picked = _solve_level(
+        contracted, root, next_edges, depth + 1, levels, expansions, sup_counter
+    )
+    if sub_picked is None:
+        return None
+
+    # 5) 展开：把下一层入选边一一映射回本层。
+    picked: list[_Edge] = []
+    entering: _Edge | None = None
+    for se in sub_picked:
+        pe = se.lower  # 本层对应边（收缩图中的边全部带 lower）
+        picked.append(pe)
+        if se.v == sup:  # 收缩层中进入超点的那唯一一条边
+            assert entering is None, "收缩环在递归解中有多条进入通道，内部不一致"
+            entering = pe
+    assert entering is not None, "收缩环在递归解中没有进入通道，内部不一致"
+
+    # 进入通道在本层落入环中的节点（可能是更早收缩出的超点）head：
+    # 删去 head 的当前环边、保留其余环边；enters 记录其最终落回的原始点。
+    head = entering.v
+    assert head in cycle_set
+    kept = [
+        in_edge[n]
+        for n in nodes_fwd
+        if n != head
+    ]
+    picked.extend(kept)
+
+    expansions.append(
+        {
+            "supernode": sup,
+            "entering_channel": entering.orig.id,
+            "enters_node": entering.enters,
+            "removed_cycle_channel": in_edge[head].orig.id,
+            "kept_cycle_channels": [e.orig.id for e in kept],
         }
     )
     return picked
@@ -206,10 +329,40 @@ def _edmonds(
     """完整 Edmonds 运行；返回 (入选边, 层级记录, 展开记录) 或 None。"""
     levels: list[dict] = []
     expansions: list[dict] = []
-    picked = _solve_level(list(nodes), root, edges, 0, levels, expansions, [0])
+    picked = _solve_level(
+        list(nodes), root, edges, 0, levels, expansions, [1]
+    )
     if picked is None:
         return None
     return picked, levels, expansions
+
+
+def _rank_of(channels: list[Channel]) -> dict[str, int]:
+    """通道标识按字典序升序的次序（键的最末位，唯一）。"""
+    return {cid: i for i, cid in enumerate(sorted(c.id for c in channels))}
+
+
+def _make_edge(c: Channel, u: str, v: str, pen: int, rank: dict[str, int]) -> _Edge:
+    return _Edge(
+        c,
+        u,
+        v,
+        (c.cost, pen, rank[c.id]),
+        enters=c.v,
+        lower=None,
+    )
+
+
+def _initial_edges(
+    channels: list[Channel], forced_ids: set[str] | None = None
+) -> list[_Edge]:
+    """构造原始层边；forced_ids 中的边在同代价时优先（规范惩罚 0）。"""
+    forced_ids = forced_ids or set()
+    rank = _rank_of(channels)
+    return [
+        _make_edge(c, c.u, c.v, 0 if c.id in forced_ids else 1, rank)
+        for c in channels
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -260,20 +413,21 @@ def _min_cost_with_forced(
     comp = {p: dsu.find(p) for p in points}
     head: dict[str, str] = {}
     for p in points:
-        if p not in parent:  # 每个连通块恰有一个无强制入边的点（头）
+        if p not in parent:  # 每个强制链块恰有一个无强制入边的点（头）
             head[comp[p]] = p
 
     forced_ids = {f.id for f in forced}
+    rank = _rank_of(channels)
     red_edges: list[_Edge] = []
     for c in channels:
         if c.id in forced_ids:
             continue
         cu, cv = comp[c.u], comp[c.v]
         if cu == cv:
-            continue  # 块内边：成环或重复入边
+            continue  # 块内边：成环或与强制链冲突
         if head[cv] != c.v:
-            continue  # 终点已有强制入边
-        red_edges.append(_Edge(c, cu, cv, (c.cost, 0, c.id), enters=cv, lower=None))
+            continue  # 终点在块内且不是链头：不能从块外给它入边
+        red_edges.append(_make_edge(c, cu, cv, 0, rank))
 
     nodes = sorted(set(comp.values()))
     root_comp = comp[root]
@@ -316,15 +470,28 @@ def solve(points: list[str], root: str, channels: list[Channel]) -> dict:
             "unreachable": unreachable,
         }
 
-    # 1) 最小总代价
-    base_edges = [
-        _Edge(c, c.u, c.v, (c.cost, 0, c.id), enters=c.v, lower=None) for c in channels
-    ]
-    run = _edmonds(list(points), root, base_edges)
+    # 1) 朴素 Edmonds 求最小总代价 C*（同代价按标识升序）。
+    run = _edmonds(list(points), root, _initial_edges(channels))
     assert run is not None, "全部可达但 Edmonds 无解，内部不一致"
+    best_cost = sum(e.orig.cost for e in run[0])
+
+    # 2) 字典序贪心：按标识升序试探强制入选，仅当不抬高最优代价时接受。
+    #    嵌套环的统一裁决完全体现在 C* 中：局部最低入口能否保留取决于
+    #    层层收缩 / 展开后的全局代价，贪心试探只在全局最优解上进行。
+    forced: list[Channel] = []
+    for c in sorted(channels, key=lambda c: c.id):
+        cand = _min_cost_with_forced(points, root, channels, forced + [c])
+        if cand == best_cost:
+            forced.append(c)
+    forced_ids = {c.id for c in forced}
+
+    # 3) 以规范惩罚重跑，使收缩 / 展开记录恰好对应规范树。
+    run = _edmonds(list(points), root, _initial_edges(channels, forced_ids))
+    assert run is not None, "规范解重跑无解，内部不一致"
     picked, levels, expansions = run
-    best_cost = sum(e.orig.cost for e in picked)
+    assert sum(e.orig.cost for e in picked) == best_cost, "规范解代价与最优代价不一致"
     final_ids = sorted(e.orig.id for e in picked)
+    assert set(final_ids) == forced_ids, "规范解与字典序强制集不一致"
 
     by_id = {c.id: c for c in channels}
     tree = [
@@ -356,7 +523,8 @@ def replay_record(
 
     复算规则：叶子层（无环层）的入选通道 ∪ 每次展开保留的环边。
     同时校验记录内部一致性：每次展开的进入通道须已在当前选中集内、
-    被替换的环边须属于对应环、最终每非根点恰有一条入边且自根可达。
+    被替换 / 保留的环边须恰好分割对应环、最终每非根点恰有一条入边且
+    自根可达。
     """
     levels: list[dict] = record["levels"]
     expansions: list[dict] = record["expansions"]
@@ -373,6 +541,12 @@ def replay_record(
             cyc = lv["cycle"]
             cycles_by_super[cyc["supernode"]] = cyc
 
+    if len(expansions) != len(cycles_by_super):
+        raise AssertionError(
+            f"展开次数 {len(expansions)} 与收缩次数 {len(cycles_by_super)} 不一致"
+        )
+
+    removed_all: list[str] = []
     for exp in expansions:
         if exp["supernode"] not in cycles_by_super:
             raise AssertionError(f"展开记录引用了未知超点 {exp['supernode']}")
@@ -381,21 +555,35 @@ def replay_record(
             raise AssertionError(
                 f"展开 {exp['supernode']} 的进入通道 {exp['entering_channel']} 不在当前选中集"
             )
-        if exp["removed_cycle_channel"] not in cyc["channels"]:
+        cycle_channels = set(cyc["channels"])
+        removed = exp["removed_cycle_channel"]
+        kept = exp["kept_cycle_channels"]
+        if removed not in cycle_channels:
             raise AssertionError(
-                f"展开 {exp['supernode']} 移除的 {exp['removed_cycle_channel']} 不属于该环"
+                f"展开 {exp['supernode']} 移除的 {removed} 不属于该环"
             )
-        for kept in exp["kept_cycle_channels"]:
-            if kept not in cyc["channels"]:
-                raise AssertionError(
-                    f"展开 {exp['supernode']} 保留的 {kept} 不属于该环"
-                )
-            selected.add(kept)
+        if any(k not in cycle_channels for k in kept):
+            raise AssertionError(
+                f"展开 {exp['supernode']} 保留的边中存在不属于该环的通道"
+            )
+        if len(set(kept)) != len(kept) or removed in kept:
+            raise AssertionError(
+                f"展开 {exp['supernode']} 的保留环边存在重复或包含被替换边"
+            )
+        if set(kept) | {removed} != cycle_channels:
+            raise AssertionError(
+                f"展开 {exp['supernode']} 的替换 / 保留边未恰好分割该环"
+            )
+        selected.update(kept)
+        removed_all.append(removed)
 
     by_id = {c.id: c for c in channels}
     for cid in selected:
         if cid not in by_id:
             raise AssertionError(f"选中通道 {cid} 不在输入中")
+    for cid in removed_all:
+        if cid in selected:
+            raise AssertionError(f"被展开替换掉的环边 {cid} 仍出现在最终树中")
     # 结构校验：每非根点恰一条入边、无环、自根可达
     indeg: dict[str, int] = {}
     for cid in selected:

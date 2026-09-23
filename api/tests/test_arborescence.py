@@ -113,6 +113,33 @@ UNREACHABLE = (
     ),
 )
 
+# 五点双层环：内层环 {v1,v3}（e05/e02），v4 与该回流闭合成外层环
+# （e08/e09），v2 为叶子。根对 v4 有两条同代价平行入口 e00/e03。
+# 逐点选最低入口会得到 18 的次优树 [e02,e06,e08,e10]；只有嵌套环统一
+# 裁决才能得到 14 的规范树 [e00,e02,e09,e11]。
+GLACIER = (
+    ["v0", "v1", "v2", "v3", "v4"],
+    "v0",
+    make(
+        ["v0", "v1", "v2", "v3", "v4"],
+        "v0",
+        [
+            ("e00", "v0", "v4", 8),
+            ("e01", "v0", "v1", 8),
+            ("e02", "v3", "v1", 3),
+            ("e03", "v0", "v4", 8),
+            ("e04", "v2", "v4", 11),
+            ("e05", "v1", "v3", 1),
+            ("e06", "v0", "v3", 7),
+            ("e07", "v3", "v4", 6),
+            ("e08", "v1", "v4", 5),
+            ("e09", "v4", "v3", 2),
+            ("e10", "v0", "v2", 3),
+            ("e11", "v1", "v2", 1),
+        ],
+    ),
+)
+
 
 class TestSamples:
     def test_nested_cycles(self):
@@ -163,6 +190,98 @@ class TestSamples:
         assert res["status"] == "unsolvable"
         assert res["unreachable"] == ["z"]
         assert res["reason"]
+
+
+class TestGlacierNested:
+    """五点双层环场景：局部低价入口必须经嵌套环统一裁决。"""
+
+    def test_optimal_cost_and_canonical_sequence(self):
+        points, root, channels = GLACIER
+        res = solve(points, root, channels)
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 14
+        assert res["canonical_ids"] == ["e00", "e02", "e09", "e11"]
+        # 逐边合计与总代价一致
+        assert sum(c["cost"] for c in res["tree"]) == 14
+
+    def test_matches_brute_force(self):
+        points, root, channels = GLACIER
+        expect = brute_force(points, root, channels)
+        assert expect == (14, ["e00", "e02", "e09", "e11"])
+
+    def test_two_nested_contractions_inner_then_outer(self):
+        points, root, channels = GLACIER
+        res = solve(points, root, channels)
+        levels = res["record"]["levels"]
+        assert res["record"]["contractions"] == 2
+        # 第 0 层：内层二点环 {v1, v3}
+        c0 = levels[0]["cycle"]
+        assert c0 is not None
+        assert set(c0["nodes"]) == {"v1", "v3"}
+        assert set(c0["channels"]) == {"e02", "e05"}
+        s1 = c0["supernode"]
+        # 第 1 层：内层超点与 v4 闭合成外层环
+        c1 = levels[1]["cycle"]
+        assert c1 is not None
+        assert set(c1["nodes"]) == {s1, "v4"}
+        assert set(c1["channels"]) == {"e08", "e09"}
+        s2 = c1["supernode"]
+        # 最深层无环
+        assert levels[2]["cycle"] is None
+        # 环内非环边 e07 被丢弃
+        assert "e07" in c1["dropped_internal"]
+        # 两次收缩产生两个不同超点
+        assert s1 != s2
+
+    def test_two_expansions_outer_then_inner(self):
+        points, root, channels = GLACIER
+        res = solve(points, root, channels)
+        exps = res["record"]["expansions"]
+        assert len(exps) == 2
+        levels = res["record"]["levels"]
+        s_outer = levels[1]["cycle"]["supernode"]
+        s_inner = levels[0]["cycle"]["supernode"]
+        # 最深层先展开：外层环先展开
+        assert exps[0]["supernode"] == s_outer
+        assert exps[0]["entering_channel"] == "e00"
+        assert exps[0]["enters_node"] == "v4"
+        assert exps[0]["removed_cycle_channel"] == "e08"
+        assert exps[0]["kept_cycle_channels"] == ["e09"]
+        # 再展开内层环：e09 进入 v3，替换 e05、保留 e02
+        assert exps[1]["supernode"] == s_inner
+        assert exps[1]["entering_channel"] == "e09"
+        assert exps[1]["enters_node"] == "v3"
+        assert exps[1]["removed_cycle_channel"] == "e05"
+        assert exps[1]["kept_cycle_channels"] == ["e02"]
+
+    def test_record_replays_to_canonical_tree(self):
+        points, root, channels = GLACIER
+        res = solve(points, root, channels)
+        assert replay_record(points, root, channels, res["record"]) == [
+            "e00", "e02", "e09", "e11"
+        ]
+
+    def test_invariant_under_submission_order(self):
+        import random
+
+        points, root, channels = GLACIER
+        import json
+
+        baseline = json.dumps(solve(points, root, channels), sort_keys=True)
+        for seed in range(25):
+            rng = random.Random(seed)
+            ps = points[:]
+            cs = channels[:]
+            rng.shuffle(ps)
+            rng.shuffle(cs)
+            res = solve(ps, root, cs)
+            assert res["total_cost"] == 14
+            assert res["canonical_ids"] == ["e00", "e02", "e09", "e11"]
+            assert res["record"]["contractions"] == 2
+            assert replay_record(ps, root, cs, res["record"]) == [
+                "e00", "e02", "e09", "e11"
+            ]
+            assert json.dumps(res, sort_keys=True) == baseline
 
 
 class TestValidation:
