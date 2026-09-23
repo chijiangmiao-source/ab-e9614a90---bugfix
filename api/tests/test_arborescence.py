@@ -113,6 +113,35 @@ UNREACHABLE = (
     ),
 )
 
+# 局部低价入口需经两层嵌套环统一裁决的场景：
+#   v1 与 v3 的最低入口互指（e08/e09，代价 1）形成内层二点环；
+#   环外 v4 经 e10 进入环、环内经 e11 进入 v4，形成第二层闭合；
+#   v2 作为叶子挂在根上。根部两条同代价入口 e00/e01（7）与看似
+#   更便宜的 e06（6）竞争——逐点贪心会选 e06 得到 18，
+#   全局最小为 14（[e00, e02, e09, e11]）。
+ADJUDICATE = (
+    ["v0", "v1", "v2", "v3", "v4"],
+    "v0",
+    make(
+        ["v0", "v1", "v2", "v3", "v4"],
+        "v0",
+        [
+            ("e00", "v0", "v1", 7),
+            ("e01", "v0", "v3", 7),
+            ("e02", "v0", "v2", 5),
+            ("e03", "v0", "v1", 9),
+            ("e04", "v0", "v3", 9),
+            ("e05", "v3", "v4", 5),
+            ("e06", "v0", "v4", 6),
+            ("e07", "v4", "v1", 9),
+            ("e08", "v3", "v1", 1),
+            ("e09", "v1", "v3", 1),
+            ("e10", "v4", "v3", 6),
+            ("e11", "v1", "v4", 1),
+        ],
+    ),
+)
+
 
 class TestSamples:
     def test_nested_cycles(self):
@@ -163,6 +192,60 @@ class TestSamples:
         assert res["status"] == "unsolvable"
         assert res["unreachable"] == ["z"]
         assert res["reason"]
+
+    def test_nested_cycle_adjudication(self):
+        """局部低价入口必须经两层嵌套环的替换代价统一裁决。
+
+        根部同代价入口 e00/e01（7）与局部更便宜的 e06（6）竞争：
+        逐点贪心会选 e06 得到次优的 18（[e02,e06,e08,e10]）；
+        全局最小为 14（[e00,e02,e09,e11]），需两次收缩与两次展开。
+        """
+        points, root, channels = ADJUDICATE
+        res = solve(points, root, channels)
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 14
+        assert res["canonical_ids"] == ["e00", "e02", "e09", "e11"]
+        # 逐边合计与总代价一致
+        assert sum(e["cost"] for e in res["tree"]) == 14
+
+        levels = res["record"]["levels"]
+        assert res["record"]["contractions"] == 2
+        # 第一层：v1 与 v3 的最低入口互指，形成内层二点环
+        assert set(levels[0]["cycle"]["nodes"]) == {"v1", "v3"}
+        s1 = levels[0]["cycle"]["supernode"]
+        # 第二层：环外 v4 与内层超点形成外层环
+        assert set(levels[1]["cycle"]["nodes"]) == {s1, "v4"}
+        assert levels[2]["cycle"] is None
+
+        exps = res["record"]["expansions"]
+        assert len(exps) == 2
+        # 先展开外层环：e00 进入超点 S1，替换 e10，保留 e11
+        assert exps[0]["supernode"] == levels[1]["cycle"]["supernode"]
+        assert exps[0]["entering_channel"] == "e00"
+        assert exps[0]["enters_node"] == s1
+        assert exps[0]["removed_cycle_channel"] == "e10"
+        assert exps[0]["kept_cycle_channels"] == ["e11"]
+        # 再展开内层环：e00 进入 v1，替换 e08，保留 e09
+        assert exps[1]["supernode"] == s1
+        assert exps[1]["entering_channel"] == "e00"
+        assert exps[1]["enters_node"] == "v1"
+        assert exps[1]["removed_cycle_channel"] == "e08"
+        assert exps[1]["kept_cycle_channels"] == ["e09"]
+
+        # 展开后的通道集合与规范树完全一致，且记录可独立复算
+        assert replay_record(points, root, channels, res["record"]) == res["canonical_ids"]
+
+    def test_submission_order_does_not_matter(self):
+        """改变点或通道的提交顺序不得改变结果（含收缩 / 展开记录）。"""
+        points, root, channels = ADJUDICATE
+        base = solve(points, root, channels)
+        rng = random.Random(20260923)
+        for _ in range(20):
+            perm_points = points[:]
+            perm_channels = channels[:]
+            rng.shuffle(perm_points)
+            rng.shuffle(perm_channels)
+            assert solve(perm_points, root, perm_channels) == base
 
 
 class TestValidation:

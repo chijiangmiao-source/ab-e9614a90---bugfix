@@ -1,7 +1,8 @@
 """verify 一次性服务：对真实 API 与经 Web 反代的同一请求做样例核对 + HTTP 冒烟。
 
-样例覆盖：嵌套环收缩、平行通道、同优规范树字典序、不可达点；
-另含输入错误（自环 / 结构非法）核对。全部断言通过则进程以 0 退出，
+样例覆盖：嵌套环收缩、平行通道、同优规范树字典序、局部低价入口的嵌套环
+裁决（总代价 14、两次收缩与两次展开）、不可达点；另含输入错误（自环 /
+结构非法）核对与提交顺序无关性核对。全部断言通过则进程以 0 退出，
 任一失败立即以非零码退出。
 """
 
@@ -118,6 +119,36 @@ SCENARIOS = {
         "expect_cost": 3,
         "expect_contractions": 0,
     },
+    # 局部低价入口需经两层嵌套环统一裁决：逐点贪心会选 e06 得到 18，
+    # 全局最小为 14（[e00, e02, e09, e11]），两次收缩与两次展开。
+    "adjudicate": {
+        "payload": {
+            "points": ["v0", "v1", "v2", "v3", "v4"],
+            "root": "v0",
+            "channels": [
+                {"id": "e00", "from": "v0", "to": "v1", "cost": 7},
+                {"id": "e01", "from": "v0", "to": "v3", "cost": 7},
+                {"id": "e02", "from": "v0", "to": "v2", "cost": 5},
+                {"id": "e03", "from": "v0", "to": "v1", "cost": 9},
+                {"id": "e04", "from": "v0", "to": "v3", "cost": 9},
+                {"id": "e05", "from": "v3", "to": "v4", "cost": 5},
+                {"id": "e06", "from": "v0", "to": "v4", "cost": 6},
+                {"id": "e07", "from": "v4", "to": "v1", "cost": 9},
+                {"id": "e08", "from": "v3", "to": "v1", "cost": 1},
+                {"id": "e09", "from": "v1", "to": "v3", "cost": 1},
+                {"id": "e10", "from": "v4", "to": "v3", "cost": 6},
+                {"id": "e11", "from": "v1", "to": "v4", "cost": 1},
+            ],
+        },
+        "expect_ids": ["e00", "e02", "e09", "e11"],
+        "expect_cost": 14,
+        "expect_contractions": 2,
+        # 依次展开外层环（e00 替换 e10，保留 e11）与内层环（e00 替换 e08，保留 e09）
+        "expect_expansions": [
+            ("e00", "e10", ["e11"]),
+            ("e00", "e08", ["e09"]),
+        ],
+    },
     "unreachable": {
         "payload": {
             "points": ["r", "a", "b", "z"],
@@ -148,6 +179,13 @@ def verify_ok_scenario(name: str, sc: dict) -> None:
           f"规范树标识序列 == {sc['expect_ids']}（实际 {body_api['canonical_ids']}）")
     check(body_api["record"]["contractions"] == sc["expect_contractions"],
           f"环收缩次数 == {sc['expect_contractions']}")
+    if "expect_expansions" in sc:
+        got = [
+            (e["entering_channel"], e["removed_cycle_channel"], e["kept_cycle_channels"])
+            for e in body_api["record"]["expansions"]
+        ]
+        want = [tuple(t[:2]) + (t[2],) for t in sc["expect_expansions"]]
+        check(got == want, f"展开替换序列 == {want}（实际 {got}）")
     replayed = replay_record(
         sc["payload"]["points"], sc["payload"]["root"],
         channels_of(sc["payload"]), body_api["record"],
@@ -157,6 +195,14 @@ def verify_ok_scenario(name: str, sc: dict) -> None:
         c["cost"] for c in body_api["tree"] if c["id"] in set(body_api["canonical_ids"])
     )
     check(cost_sum == body_api["total_cost"], "逐边代价之和等于总代价")
+    # 改变点与通道的提交顺序，结果不得改变
+    shuffled = {
+        "points": list(reversed(sc["payload"]["points"])),
+        "root": sc["payload"]["root"],
+        "channels": list(reversed(sc["payload"]["channels"])),
+    }
+    _, body_rev = http("POST", f"{API}/api/solve", shuffled)
+    check(body_rev == body_api, "点 / 通道提交顺序不影响结果")
 
 
 def verify_unreachable_scenario() -> None:
@@ -218,7 +264,7 @@ def main() -> int:
         return 1
 
     print("== 真实 API 与页面结果核对 ==")
-    for name in ("nested", "parallel", "canonical"):
+    for name in ("nested", "parallel", "canonical", "adjudicate"):
         verify_ok_scenario(name, SCENARIOS[name])
     verify_unreachable_scenario()
     verify_invalid_inputs()
